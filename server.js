@@ -1,127 +1,129 @@
 const express = require('express');
 const cors = require('cors');
-const youtubedl = require('youtube-dl-exec');
+const { spawn } = require('child_process');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
-// Helper function to format seconds to MM:SS
-const formatDuration = (seconds) => {
-    if (!seconds) return "00:00";
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-};
+// Root Route
+app.get('/', (req, res) => {
+    res.send('Nexus YT Backend is Live!');
+});
 
-// --- Supported Sources API ---
+// Analyze Media Route using yt-dlp
+app.post('/api/analyze', async (req, res) => {
+    const { url } = req.body;
+    if (!url) {
+        return res.status(400).json({ error: 'URL is required' });
+    }
+
+    try {
+        const ytdlp = spawn('yt-dlp', ['--dump-json', '--no-warnings', url]);
+        let dataString = '';
+        let errorString = '';
+
+        ytdlp.stdout.on('data', (data) => {
+            dataString += data.toString();
+        });
+
+        ytdlp.stderr.on('data', (data) => {
+            errorString += data.toString();
+        });
+
+        ytdlp.on('close', (code) => {
+            if (code !== 0 || !dataString) {
+                console.error(`yt-dlp error: ${errorString}`);
+                return res.status(500).json({ error: 'Failed to extract media info' });
+            }
+
+            try {
+                const info = JSON.parse(dataString);
+                
+                // Format response for frontend
+                const mediaData = {
+                    id: info.id || 'vid_' + Date.now(),
+                    url: url,
+                    title: info.title || 'Unknown Title',
+                    author: info.uploader || info.channel || 'Unknown Author',
+                    duration: formatDuration(info.duration),
+                    views: info.view_count ? `${info.view_count.toLocaleString()} views` : 'Views unavailable',
+                    type: 'Video',
+                    thumbnail: info.thumbnail || '',
+                    videoFormats: (info.formats || [])
+                        .filter(f => f.vcodec !== 'none' && f.acodec !== 'none' && f.height)
+                        .map(f => ({
+                            id: f.format_id,
+                            res: `${f.height}p`,
+                            ext: f.ext || 'mp4',
+                            size: f.filesize ? (f.filesize / (1024*1024)).toFixed(1) + ' MB' : 'Varies'
+                        })),
+                    audioFormats: [
+                        { id: 'bestaudio', quality: '128 kbps', ext: 'm4a', size: 'Approx. 5 MB' }
+                    ],
+                    thumbnails: info.thumbnails ? info.thumbnails.map(t => ({ res: t.id || 'Thumb', url: t.url, id: t.url })) : [],
+                    subtitles: []
+                };
+
+                res.json(mediaData);
+            } catch (parseError) {
+                console.error('JSON Parse error:', parseError);
+                res.status(500).json({ error: 'Internal server error during parsing' });
+            }
+        });
+    } catch (err) {
+        console.error('Server error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Download Route
+app.get('/api/download', (req, res) => {
+    const { url, formatId } = req.query;
+    if (!url) return res.status(400).send('URL is required');
+
+    try {
+        const args = ['-f', formatId || 'best', '-o', '-', url];
+        const ytdlpProcess = spawn('yt-dlp', args);
+
+        res.setHeader('Content-Disposition', 'attachment; filename="downloaded_media.mp4"');
+        
+        ytdlpProcess.stdout.pipe(res);
+
+        ytdlpProcess.stderr.on('data', (data) => {
+            console.error(`Download stderr: ${data}`);
+        });
+
+        ytdlpProcess.on('close', (code) => {
+            if (code !== 0) {
+                console.error(`Download process exited with code ${code}`);
+            }
+        });
+    } catch (err) {
+        console.error('Download route error:', err);
+        res.status(500).send('Download failed');
+    }
+});
+
+// Supported Sources Route
 app.get('/api/supported-sources', (req, res) => {
     res.json([
-        { name: 'YouTube', types: 'Video, Audio', status: 'Supported' },
-        { name: 'Facebook', types: 'Video', status: 'Supported' },
-        { name: 'Instagram', types: 'Video, Reels', status: 'Supported' },
-        { name: 'Twitter / X', types: 'Video', status: 'Supported' }
+        { name: 'YouTube', types: 'Video, Audio, Playlist', status: 'Active' },
+        { name: 'Facebook', types: 'Video', status: 'Active' },
+        { name: 'Instagram', types: 'Reels, Posts', status: 'Active' }
     ]);
 });
 
-// --- Analyze API ---
-app.post('/api/analyze', async (req, res) => {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: 'URL is required' });
-
-    try {
-        console.log(`Analyzing: ${url}`);
-        const info = await youtubedl(url, {
-            dumpSingleJson: true,
-            noWarnings: true,
-            noCallHome: true,
-            noCheckCertificate: true,
-            preferFreeFormats: true,
-            youtubeSkipDashManifest: true,
-        });
-
-        const videoFormats = [];
-        const audioFormats = [];
-
-        if (info.formats) {
-            info.formats.forEach(f => {
-                if (f.vcodec !== 'none' && f.acodec !== 'none') {
-                    videoFormats.push({
-                        res: f.format_note || `${f.height}p`,
-                        ext: f.ext,
-                        size: f.filesize ? (f.filesize / (1024 * 1024)).toFixed(1) + ' MB' : 'Unknown',
-                        id: f.format_id
-                    });
-                } else if (f.vcodec === 'none' && f.acodec !== 'none') {
-                    audioFormats.push({
-                        quality: f.abr ? `${f.abr} kbps` : 'Audio',
-                        ext: f.ext,
-                        size: f.filesize ? (f.filesize / (1024 * 1024)).toFixed(1) + ' MB' : 'Unknown',
-                        id: f.format_id
-                    });
-                }
-            });
-        }
-
-        const data = {
-            id: info.id || 'vid_' + Date.now(),
-            url: url,
-            title: info.title || 'Untitled Media',
-            author: info.uploader || 'Unknown Creator',
-            duration: formatDuration(info.duration),
-            views: info.view_count ? info.view_count.toLocaleString() + ' views' : 'N/A',
-            type: 'Video',
-            thumbnail: info.thumbnail || '',
-            videoFormats: videoFormats.length > 0 ? videoFormats : [{ res: '720p', ext: 'mp4', size: 'Unknown', id: 'best' }],
-            audioFormats: audioFormats.length > 0 ? audioFormats : [{ quality: '128 kbps', ext: 'mp3', size: 'Unknown', id: 'bestaudio' }],
-            thumbnails: info.thumbnails ? info.thumbnails.map((t, i) => ({
-                res: t.resolution || `Thumb ${i + 1}`,
-                url: t.url,
-                id: `t_${i}`
-            })).reverse().slice(0, 5) : [],
-            subtitles: []
-        };
-
-        res.json(data);
-    } catch (error) {
-        console.error('Analyze error:', error);
-        res.status(500).json({ error: 'Failed to analyze media' });
-    }
-});
-
-// --- Download API ---
-app.get('/api/download', (req, res) => {
-    const { url, formatId, title, ext } = req.query;
-    if (!url || !formatId) return res.status(400).send('Missing url or formatId');
-
-    const cleanTitle = (title || 'download').replace(/[/\\?%*:|"<>]/g, '_');
-    const fileName = `${cleanTitle}.${ext || 'mp4'}`;
-    
-    res.header('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`);
-    console.log(`Downloading: ${url} (Format: ${formatId})`);
-
-    try {
-        const subprocess = youtubedl.exec(url, {
-            format: formatId,
-            output: '-',
-            noWarnings: true
-        });
-
-        subprocess.stdout.pipe(res);
-
-        subprocess.on('error', (err) => {
-            console.error('Download error:', err);
-            if (!res.headersSent) res.status(500).send('Download failed');
-        });
-    } catch (err) {
-        console.error('Subprocess error:', err);
-        if (!res.headersSent) res.status(500).send('Download failed');
-    }
-});
+function formatDuration(seconds) {
+    if (!seconds) return '00:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+}
 
 app.listen(PORT, () => {
-    console.log(`Nexus YT Backend running on port ${PORT}`);
+    console.log(`Server is running on port ${PORT}`);
 });
-              
+                                   
